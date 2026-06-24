@@ -361,39 +361,83 @@ def _parse_whisper_output(whisper_result: dict) -> str:
     return "\n\n".join(paragraphs)
 
 
+def _html_to_text(body_html: str) -> str:
+    """Convert Substack body_html to plain text paragraphs."""
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError:
+        raise RuntimeError("Install: pip3 install beautifulsoup4")
+    import html as _html_mod
+    soup = BeautifulSoup(body_html, "html.parser")
+    # Remove scripts, styles, figures (images handled separately)
+    for tag in soup(["script", "style", "figure", "figcaption"]):
+        tag.decompose()
+    paragraphs = []
+    for elem in soup.find_all(["p", "h1", "h2", "h3", "h4", "li", "blockquote"]):
+        text = elem.get_text(" ", strip=True)
+        text = _html_mod.unescape(text).strip()
+        if text and len(text) > 2:
+            paragraphs.append(text)
+    return "\n\n".join(paragraphs)
+
+
 def transcribe_substack(url: str) -> tuple[str, str]:
-    """Returns (transcript_text, post_title). Parses text from meta tags + OCRs content images."""
+    """Returns (transcript_text, post_title).
+    - Full articles: fetches body_html from Substack JSON API.
+    - Notes (/note/...): parses og:description + OCRs attached images.
+    """
     import urllib.request as _req
     import urllib.parse as _parse
+    import html as _html
 
     headers = {
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
         "Accept": "text/html,application/xhtml+xml",
     }
 
+    # --- Detect URL type ---
+    is_note = "/note/" in url
+
+    # --- Fetch HTML for title + images regardless ---
     req = _req.Request(url, headers=headers)
-    html = _req.urlopen(req, timeout=15).read().decode("utf-8", errors="replace")
+    html_page = _req.urlopen(req, timeout=15).read().decode("utf-8", errors="replace")
 
-    # --- Extract note/post text from og:description ---
-    title_match = re.search(r'<meta[^>]+property="og:title"[^>]+content="([^"]+)"', html)
-    desc_match = re.search(r'<meta[^>]+name="description"[^>]+content="([^"]+)"', html)
-
+    title_match = re.search(r'<meta[^>]+property="og:title"[^>]+content="([^"]+)"', html_page)
     title = "Substack Post"
     if title_match:
-        raw = title_match.group(1)
-        # Strip " (@handle)" suffix Substack appends to note titles
+        raw = _html.unescape(title_match.group(1))
         title = re.sub(r'\s*\(@[^)]+\)\s*$', '', raw).strip() or raw.strip()
 
+    # --- Full article: use JSON API ---
+    if not is_note:
+        # Extract publication domain + slug from URL
+        m = re.match(r'https?://([^/]+)/p/([^/?#]+)', url)
+        if m:
+            domain, slug = m.group(1), m.group(2)
+            api_url = f"https://{domain}/api/v1/posts/{slug}"
+            try:
+                api_req = _req.Request(api_url, headers={"User-Agent": "Mozilla/5.0"})
+                api_data = json.loads(_req.urlopen(api_req, timeout=15).read())
+                body_html = api_data.get("body_html", "")
+                if body_html:
+                    title = api_data.get("title") or title
+                    article_text = _html_to_text(body_html)
+                    if article_text.strip():
+                        return article_text, title
+            except Exception as e:
+                print(f"[API fetch failed, falling back to HTML: {e}]", file=sys.stderr)
+
+    # --- Notes (or API fallback): og:description + image OCR ---
+    desc_match = re.search(r'<meta[^>]+name="description"[^>]+content="([^"]+)"', html_page)
     note_text = ""
     if desc_match:
-        import html as _html
         note_text = _html.unescape(desc_match.group(1)).strip()
 
     # --- Find content image URLs (S3-hosted, skip profile pics by size pattern) ---
     # Substack CDN URLs embed original S3 paths; content images are 2550x3300 or large
     s3_urls = re.findall(
         r'https://substack-post-media\.s3\.amazonaws\.com/public/images/([^"\'&]+\.(?:jpeg|jpg|png))',
-        html
+        html_page
     )
     # Build full S3 URLs, deduplicate, filter out tiny profile pics (named with _72 or _108 etc.)
     seen = set()
@@ -438,6 +482,13 @@ def transcribe_substack(url: str) -> tuple[str, str]:
                     image_texts.append(ocr_text)
             except Exception as e:
                 print(f"[OCR failed for image {i}: {e}]", file=sys.stderr)
+
+        # Sort pages by the "Page N" footer OCR typically picks up (e.g. "Page 1", "Page 2")
+        def _page_num(t: str) -> int:
+            m = re.search(r'\bPage\s+(\d+)\b', t, re.IGNORECASE)
+            return int(m.group(1)) if m else 9999
+
+        image_texts.sort(key=_page_num)
 
     # --- Combine note text + OCR'd image text ---
     parts = [note_text] if note_text else []
