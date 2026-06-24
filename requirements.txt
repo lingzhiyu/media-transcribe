@@ -1,0 +1,9 @@
+openai-whisper
+praw
+playwright
+pytesseract
+Pillow
+beautifulsoup4
+requests
+brotli
+anthropic
