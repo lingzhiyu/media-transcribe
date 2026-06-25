@@ -1,9 +1,10 @@
 openai-whisper
+yt-dlp
 praw
-playwright
 pytesseract
 Pillow
 beautifulsoup4
 requests
 brotli
 anthropic
+python-dotenv
