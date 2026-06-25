@@ -369,11 +369,13 @@ def _html_to_text(body_html: str) -> str:
         raise RuntimeError("Install: pip3 install beautifulsoup4")
     import html as _html_mod
     soup = BeautifulSoup(body_html, "html.parser")
-    # Remove scripts, styles, figures (images handled separately)
     for tag in soup(["script", "style", "figure", "figcaption"]):
         tag.decompose()
     paragraphs = []
     for elem in soup.find_all(["p", "h1", "h2", "h3", "h4", "li", "blockquote"]):
+        # Skip <p> tags nested directly inside <li> — the <li> already captures the text
+        if elem.name == "p" and elem.parent and elem.parent.name == "li":
+            continue
         text = elem.get_text(" ", strip=True)
         text = _html_mod.unescape(text).strip()
         if text and len(text) > 2:
