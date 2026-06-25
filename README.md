@@ -38,7 +38,7 @@ cd media-transcribe
 ```
 
 `install.sh`:
-- Installs system tools via `brew` on macOS (skipped on Linux — install manually)
+- Installs system tools via `brew` on macOS (`apt` on Linux)
 - Creates a Python virtual environment at `venv/`
 - Installs Python packages from `requirements.txt` into the venv
 
@@ -89,13 +89,13 @@ Claude will run the script, OCR any images, write a summary, update the saved fi
 ```bash
 # With venv activated
 source venv/bin/activate
-python transcribe.py "https://www.youtube.com/watch?v=..."
+python3 transcribe.py "https://www.youtube.com/watch?v=..."
 
 # Or directly
-./venv/bin/python transcribe.py "https://www.tiktok.com/@user/video/..."
-./venv/bin/python transcribe.py "https://www.instagram.com/reels/..."
-./venv/bin/python transcribe.py "https://substack.com/@author/note/..."
-./venv/bin/python transcribe.py "https://www.reddit.com/r/..."
+./venv/bin/python3 transcribe.py "https://www.tiktok.com/@user/video/..."
+./venv/bin/python3 transcribe.py "https://www.instagram.com/reels/..."
+./venv/bin/python3 transcribe.py "https://substack.com/@author/note/..."
+./venv/bin/python3 transcribe.py "https://www.reddit.com/r/..."
 ```
 
 ## How it works
