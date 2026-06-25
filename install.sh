@@ -1,15 +1,29 @@
 #!/bin/bash
-# Install all dependencies for media-transcribe
-
 set -e
 
 echo "→ Installing system dependencies..."
-brew install yt-dlp ffmpeg tesseract
+if command -v brew &>/dev/null; then
+    brew install ffmpeg tesseract
+elif [[ "$(uname)" == "Linux" ]]; then
+    echo "  (Linux detected — installing via apt-get)"
+    sudo apt-get update -qq
+    sudo apt-get install -y ffmpeg tesseract-ocr
+else
+    echo "  (unknown OS — install ffmpeg and tesseract manually)"
+fi
 
-echo "→ Installing Python packages..."
-pip3 install --break-system-packages -r requirements.txt
+echo "→ Creating Python virtual environment..."
+python3 -m venv venv
 
-echo "→ Installing Playwright browser..."
-python3 -m playwright install chromium
+echo "→ Installing Python packages into venv..."
+./venv/bin/pip install -r requirements.txt
 
-echo "✅ Done. Run: python3 transcribe.py <url>"
+echo ""
+echo "✅ Done. Activate the venv and run:"
+echo "   source venv/bin/activate"
+echo "   python transcribe.py <url>"
+echo ""
+echo "Or without activating:"
+echo "   ./venv/bin/python transcribe.py <url>"
+echo ""
+echo "Don't forget to copy .env.example → .env and set STORAGE_ROOT."

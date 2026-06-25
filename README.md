@@ -18,18 +18,18 @@ Paste a YouTube, TikTok, Instagram, or Substack link — Claude runs the transcr
 
 Each transcript is saved to:
 ```
-~/Obsidian/media-gobbler/{source}/YYYYMMDD_HHMMSS_{title}.md
+$STORAGE_ROOT/{source}/YYYYMMDD_HHMMSS_{title}.md
 ```
 
 Every file contains:
 - **Title** — from video/post metadata, or derived from the transcript if missing
 - **Source URL**
-- **Summary** — 5–8 key-idea bullets written by Claude
+- **Summary** — key-idea bullets
 - **Full Transcript** — complete text with natural paragraph breaks
 
 ## Installation
 
-**Requires macOS + Homebrew.**
+**System dependencies:** `yt-dlp`, `ffmpeg`, `tesseract` — install via Homebrew (macOS) or your package manager (Linux).
 
 ```bash
 git clone https://github.com/lingzhiyu/media-transcribe
@@ -37,10 +37,33 @@ cd media-transcribe
 ./install.sh
 ```
 
-`install.sh` installs:
-- System tools via `brew`: `yt-dlp`, `ffmpeg`, `tesseract`
-- Python packages via `pip3`: see `requirements.txt`
-- Chromium browser via `playwright`
+`install.sh`:
+- Installs system tools via `brew` on macOS (skipped on Linux — install manually)
+- Creates a Python virtual environment at `venv/`
+- Installs Python packages from `requirements.txt` into the venv
+
+## Configuration
+
+Copy the example env file and set your storage path:
+
+```bash
+cp .env.example .env
+```
+
+Then edit `.env`:
+
+```
+STORAGE_ROOT=/path/to/your/obsidian/vault/Transcription
+```
+
+Paths with spaces and `~` are both supported, e.g.:
+
+```
+STORAGE_ROOT=/mnt/g/My Drive/Andy's Obsidian Vault/Transcription
+STORAGE_ROOT=~/Documents/Obsidian/Transcription
+```
+
+`STORAGE_ROOT` is required — the script will exit with a clear error if it is not set.
 
 ## Usage
 
@@ -64,10 +87,15 @@ Claude will run the script, OCR any images, write a summary, update the saved fi
 ### As a standalone script
 
 ```bash
-python3 transcribe.py "https://www.youtube.com/watch?v=..."
-python3 transcribe.py "https://www.tiktok.com/@user/video/..."
-python3 transcribe.py "https://www.instagram.com/reels/..."
-python3 transcribe.py "https://substack.com/@author/note/..."
+# With venv activated
+source venv/bin/activate
+python transcribe.py "https://www.youtube.com/watch?v=..."
+
+# Or directly
+./venv/bin/python transcribe.py "https://www.tiktok.com/@user/video/..."
+./venv/bin/python transcribe.py "https://www.instagram.com/reels/..."
+./venv/bin/python transcribe.py "https://substack.com/@author/note/..."
+./venv/bin/python transcribe.py "https://www.reddit.com/r/..."
 ```
 
 ## How it works
@@ -78,8 +106,8 @@ python3 transcribe.py "https://substack.com/@author/note/..."
 | 2 | Source handler extracts content (captions / audio / OCR) |
 | 3 | Text is parsed into natural paragraphs using silence gaps (>1.5s) |
 | 4 | Title is derived from metadata, falling back to first transcript sentence |
-| 5 | File saved to Obsidian vault under `/{source}/YYYYMMDD_title.md` |
-| 6 | Claude reads the transcript, writes a 5–8 bullet summary, updates the file |
+| 5 | File saved to `$STORAGE_ROOT/{source}/YYYYMMDD_title.md` |
+| 6 | Claude reads the transcript, writes a summary, updates the file |
 
 ### Substack notes
 Substack notes are fetched statically (no browser needed). The note text comes from `og:description`; attached document images are downloaded and OCR'd with Tesseract in page order. Square avatar thumbnails are filtered out automatically.
@@ -90,17 +118,8 @@ Uses `yt-dlp -x` to extract the native AAC audio stream (avoids the video-only M
 ### YouTube
 Uses `yt-dlp` to download SRT captions, preferring manual subtitles over auto-generated. Paragraph breaks are detected from timestamp gaps in the SRT file.
 
-## Storage path
-
-Defaults to:
-```
-~/Library/Mobile Documents/iCloud~md~obsidian/Documents/ZY Combined/media-gobbler/
-```
-
-Change `STORAGE_ROOT` at the top of `transcribe.py` to point to your own vault.
-
 ## Requirements
 
-- macOS (Homebrew)
 - Python 3.10+
-- See `requirements.txt` for Python packages
+- `yt-dlp`, `ffmpeg`, `tesseract` (system packages)
+- See `requirements.txt` for Python packages (installed into `venv/` by `install.sh`)

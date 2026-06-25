@@ -9,6 +9,13 @@ from datetime import datetime
 from pathlib import Path
 from urllib.request import urlopen, Request
 
+from dotenv import load_dotenv
+load_dotenv()
+
+_BIN = Path(sys.executable).parent
+YT_DLP = str(_BIN / "yt-dlp")
+WHISPER_BIN = str(_BIN / "whisper")
+
 try:
     import praw
     PRAW_AVAILABLE = True
@@ -21,7 +28,13 @@ try:
 except ImportError:
     WHISPER_AVAILABLE = False
 
-STORAGE_ROOT = Path("/Users/zhiyuling/Library/Mobile Documents/iCloud~md~obsidian/Documents/ZY Combined/media-gobbler")
+_storage_root_env = os.getenv("STORAGE_ROOT")
+if not _storage_root_env:
+    raise RuntimeError(
+        "STORAGE_ROOT is not set. Create a .env file with:\n"
+        "  STORAGE_ROOT=/path/to/your/vault/folder"
+    )
+STORAGE_ROOT = Path(_storage_root_env).expanduser()
 
 
 def detect_source(url: str) -> str:
@@ -43,7 +56,7 @@ def transcribe_youtube(url: str) -> tuple[str, str]:
     with tempfile.TemporaryDirectory() as tmpdir:
         result = subprocess.run(
             [
-                "yt-dlp",
+                YT_DLP,
                 "--write-sub",
                 "--write-auto-sub",
                 "--write-info-json",
@@ -253,7 +266,7 @@ def _whisper_transcribe(audio_path: str, model_name: str = "base", language: str
 
     # Fallback: call whisper CLI and parse the resulting JSON
     result = subprocess.run(
-        ["whisper", audio_path, "--model", model_name, "--language", language,
+        [WHISPER_BIN, audio_path, "--model", model_name, "--language", language,
          "--output_format", "json", "--output_dir", os.path.dirname(audio_path)],
         capture_output=True, text=True,
     )
@@ -265,8 +278,7 @@ def _whisper_transcribe(audio_path: str, model_name: str = "base", language: str
 
 def transcribe_tiktok(url: str) -> tuple[str, str]:
     """Returns (transcript_text, video_title). Uses yt-dlp audio extraction + Whisper."""
-    whisper_available = WHISPER_AVAILABLE or bool(subprocess.run(
-        ["which", "whisper"], capture_output=True).returncode == 0)
+    whisper_available = WHISPER_AVAILABLE or Path(WHISPER_BIN).exists()
     if not whisper_available:
         raise RuntimeError("Whisper not installed. Run: pip3 install openai-whisper")
 
@@ -276,7 +288,7 @@ def transcribe_tiktok(url: str) -> tuple[str, str]:
         # Fetch metadata first (title)
         print("[fetching metadata...]", file=sys.stderr)
         meta_result = subprocess.run(
-            ["yt-dlp", "--dump-json", url],
+            [YT_DLP, "--dump-json", url],
             capture_output=True, text=True,
         )
         title = "TikTok Video"
@@ -293,7 +305,7 @@ def transcribe_tiktok(url: str) -> tuple[str, str]:
         print("[downloading audio...]", file=sys.stderr)
         result = subprocess.run(
             [
-                "yt-dlp",
+                YT_DLP,
                 "-f", "worstaudio[acodec=aac]/bestaudio[acodec=aac]/worstvideo[acodec=aac]/bestaudio/worst",
                 "-x",
                 "-o", os.path.join(tmpdir, "video.%(ext)s"),
@@ -503,15 +515,14 @@ def transcribe_substack(url: str) -> tuple[str, str]:
 
 def _transcribe_video_url(url: str, source_label: str = "Video") -> tuple[str, str]:
     """Generic video URL transcriber via yt-dlp -x + Whisper. Used for Instagram etc."""
-    whisper_available = WHISPER_AVAILABLE or bool(subprocess.run(
-        ["which", "whisper"], capture_output=True).returncode == 0)
+    whisper_available = WHISPER_AVAILABLE or Path(WHISPER_BIN).exists()
     if not whisper_available:
         raise RuntimeError("Whisper not installed. Run: pip3 install openai-whisper")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         # Fetch metadata
         meta_result = subprocess.run(
-            ["yt-dlp", "--dump-json", url], capture_output=True, text=True,
+            [YT_DLP, "--dump-json", url], capture_output=True, text=True,
         )
         title = f"{source_label} Video"
         if meta_result.returncode == 0:
@@ -523,7 +534,7 @@ def _transcribe_video_url(url: str, source_label: str = "Video") -> tuple[str, s
 
         # Download audio (keep native format to avoid codec detection issues)
         result = subprocess.run(
-            ["yt-dlp", "-x", "-o", os.path.join(tmpdir, "video.%(ext)s"), url],
+            [YT_DLP, "-x", "-o", os.path.join(tmpdir, "video.%(ext)s"), url],
             capture_output=True, text=True,
         )
         if result.returncode != 0:
