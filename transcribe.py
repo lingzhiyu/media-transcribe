@@ -5,9 +5,33 @@ import sys
 import tempfile
 import os
 import json
+import shutil
 from datetime import datetime
 from pathlib import Path
 from urllib.request import urlopen, Request
+
+from dotenv import load_dotenv
+load_dotenv()
+
+# Resolve binaries from the venv that owns this interpreter, falling back to PATH.
+# Works correctly whether invoked as `./venv/bin/python3` or with system Python.
+_VENV_BIN = Path(sys.executable).parent
+def _resolve_bin(name: str) -> str:
+    venv_path = _VENV_BIN / name
+    if os.access(venv_path, os.X_OK):
+        return str(venv_path)
+    on_path = shutil.which(name)
+    return on_path if on_path else name
+
+YT_DLP = _resolve_bin("yt-dlp")
+WHISPER_BIN = _resolve_bin("whisper")
+
+def _require_ytdlp() -> None:
+    if not os.access(YT_DLP, os.X_OK):
+        raise RuntimeError(
+            "yt-dlp not found. Run ./install.sh, then invoke via ./venv/bin/python3 "
+            "or activate the venv first: source venv/bin/activate"
+        )
 
 try:
     import praw
@@ -21,7 +45,13 @@ try:
 except ImportError:
     WHISPER_AVAILABLE = False
 
-STORAGE_ROOT = Path("/Users/zhiyuling/Library/Mobile Documents/iCloud~md~obsidian/Documents/ZY Combined/media-gobbler")
+_storage_root_env = os.getenv("STORAGE_ROOT")
+if not _storage_root_env:
+    raise RuntimeError(
+        "STORAGE_ROOT is not set. Copy .env.example to .env and set:\n"
+        "  STORAGE_ROOT=/path/to/your/vault/folder"
+    )
+STORAGE_ROOT = Path(_storage_root_env).expanduser()
 
 
 def detect_source(url: str) -> str:
@@ -40,10 +70,11 @@ def detect_source(url: str) -> str:
 
 def transcribe_youtube(url: str) -> tuple[str, str]:
     """Returns (transcript_text, video_title)"""
+    _require_ytdlp()
     with tempfile.TemporaryDirectory() as tmpdir:
         result = subprocess.run(
             [
-                "yt-dlp",
+                YT_DLP,
                 "--write-sub",
                 "--write-auto-sub",
                 "--write-info-json",
@@ -253,7 +284,7 @@ def _whisper_transcribe(audio_path: str, model_name: str = "base", language: str
 
     # Fallback: call whisper CLI and parse the resulting JSON
     result = subprocess.run(
-        ["whisper", audio_path, "--model", model_name, "--language", language,
+        [WHISPER_BIN, audio_path, "--model", model_name, "--language", language,
          "--output_format", "json", "--output_dir", os.path.dirname(audio_path)],
         capture_output=True, text=True,
     )
@@ -265,8 +296,8 @@ def _whisper_transcribe(audio_path: str, model_name: str = "base", language: str
 
 def transcribe_tiktok(url: str) -> tuple[str, str]:
     """Returns (transcript_text, video_title). Uses yt-dlp audio extraction + Whisper."""
-    whisper_available = WHISPER_AVAILABLE or bool(subprocess.run(
-        ["which", "whisper"], capture_output=True).returncode == 0)
+    _require_ytdlp()
+    whisper_available = WHISPER_AVAILABLE or os.access(WHISPER_BIN, os.X_OK)
     if not whisper_available:
         raise RuntimeError("Whisper not installed. Run: pip3 install openai-whisper")
 
@@ -276,7 +307,7 @@ def transcribe_tiktok(url: str) -> tuple[str, str]:
         # Fetch metadata first (title)
         print("[fetching metadata...]", file=sys.stderr)
         meta_result = subprocess.run(
-            ["yt-dlp", "--dump-json", url],
+            [YT_DLP, "--dump-json", url],
             capture_output=True, text=True,
         )
         title = "TikTok Video"
@@ -293,7 +324,7 @@ def transcribe_tiktok(url: str) -> tuple[str, str]:
         print("[downloading audio...]", file=sys.stderr)
         result = subprocess.run(
             [
-                "yt-dlp",
+                YT_DLP,
                 "-f", "worstaudio[acodec=aac]/bestaudio[acodec=aac]/worstvideo[acodec=aac]/bestaudio/worst",
                 "-x",
                 "-o", os.path.join(tmpdir, "video.%(ext)s"),
@@ -505,15 +536,15 @@ def transcribe_substack(url: str) -> tuple[str, str]:
 
 def _transcribe_video_url(url: str, source_label: str = "Video") -> tuple[str, str]:
     """Generic video URL transcriber via yt-dlp -x + Whisper. Used for Instagram etc."""
-    whisper_available = WHISPER_AVAILABLE or bool(subprocess.run(
-        ["which", "whisper"], capture_output=True).returncode == 0)
+    _require_ytdlp()
+    whisper_available = WHISPER_AVAILABLE or os.access(WHISPER_BIN, os.X_OK)
     if not whisper_available:
         raise RuntimeError("Whisper not installed. Run: pip3 install openai-whisper")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         # Fetch metadata
         meta_result = subprocess.run(
-            ["yt-dlp", "--dump-json", url], capture_output=True, text=True,
+            [YT_DLP, "--dump-json", url], capture_output=True, text=True,
         )
         title = f"{source_label} Video"
         if meta_result.returncode == 0:
@@ -525,7 +556,7 @@ def _transcribe_video_url(url: str, source_label: str = "Video") -> tuple[str, s
 
         # Download audio (keep native format to avoid codec detection issues)
         result = subprocess.run(
-            ["yt-dlp", "-x", "-o", os.path.join(tmpdir, "video.%(ext)s"), url],
+            [YT_DLP, "-x", "-o", os.path.join(tmpdir, "video.%(ext)s"), url],
             capture_output=True, text=True,
         )
         if result.returncode != 0:
@@ -544,8 +575,190 @@ def _transcribe_video_url(url: str, source_label: str = "Video") -> tuple[str, s
 
 
 def transcribe_instagram(url: str) -> tuple[str, str]:
-    """Returns (transcript_text, title). Uses same approach as TikTok."""
-    return _transcribe_video_url(url, source_label="Instagram")
+    """Returns (transcript_text, title).
+
+    Strategy:
+    - Scrapes the /embed/ page to get the caption and detect post type.
+    - Carousels / image posts: uses Playwright to screenshot each slide (bypasses
+      CDN auth) then OCRs the screenshots.
+    - Video posts: falls back to yt-dlp audio + Whisper.
+    """
+    import urllib.request as _req, html as _html_mod
+
+    # ── Step 1: Fetch embed page for metadata & post-type detection ──────────
+    shortcode = re.search(r'/p/([A-Za-z0-9_-]+)', url)
+    if not shortcode:
+        raise RuntimeError(f"Cannot parse Instagram shortcode from URL: {url}")
+    sc = shortcode.group(1)
+    embed_url = f"https://www.instagram.com/p/{sc}/embed/"
+
+    embed_headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+        "Accept": "text/html",
+    }
+    try:
+        page_html = _req.urlopen(
+            _req.Request(embed_url, headers=embed_headers), timeout=15
+        ).read().decode("utf-8", errors="replace")
+    except Exception as e:
+        page_html = ""
+
+    # Detect whether this is a video or image/carousel post
+    is_video = bool(re.search(r'"is_video"\s*:\s*true', page_html))
+
+    # Caption from embed JSON
+    normalised = page_html.replace(r"\\/", "/").replace(r"\/", "/")
+    cap_m = re.search(
+        r'"edge_media_to_caption".*?"text"\s*:\s*"((?:[^"\\]|\\.)*)"',
+        normalised, re.DOTALL
+    )
+    caption = ""
+    if cap_m:
+        try:
+            caption = cap_m.group(1).encode("utf-8").decode("unicode_escape")
+        except Exception:
+            caption = cap_m.group(1)
+        caption = caption.replace("\\n", "\n").strip()
+
+    # Title from caption first line, or fallback
+    first_line = caption.split("\n")[0].strip() if caption else ""
+    title = first_line[:80] if first_line else f"Instagram Post {sc}"
+
+    # ── Step 2a: Image / carousel → Playwright screenshot + OCR ─────────────
+    if not is_video:
+        try:
+            import pytesseract
+            from PIL import Image
+            import io as _io
+        except ImportError:
+            raise RuntimeError(
+                "Install: pip3 install pytesseract Pillow && brew install tesseract"
+            )
+
+        try:
+            from playwright.sync_api import sync_playwright
+        except ImportError:
+            raise RuntimeError(
+                "Install: pip3 install playwright && playwright install chromium"
+            )
+
+        screenshots: list[bytes] = []
+        with sync_playwright() as pw:
+            import tempfile, shutil
+            tmp_profile = tempfile.mkdtemp(prefix="ig_pw_")
+            try:
+                ctx = pw.chromium.launch_persistent_context(
+                    user_data_dir=tmp_profile,
+                    headless=True,
+                    args=["--disable-blink-features=AutomationControlled"],
+                )
+                pg = ctx.new_page()
+                pg.goto(url, wait_until="domcontentloaded", timeout=30000)
+                pg.wait_for_timeout(2000)
+
+                # Dismiss login/signup modal if present (Escape or close button)
+                try:
+                    pg.keyboard.press("Escape")
+                    pg.wait_for_timeout(500)
+                except Exception:
+                    pass
+                try:
+                    close = pg.locator("[aria-label='Close']").first
+                    if close.is_visible(timeout=1000):
+                        close.click(force=True)
+                        pg.wait_for_timeout(500)
+                except Exception:
+                    pass
+
+                # Find the article/post container
+                article = pg.locator("article").first
+
+                def _shot_slide() -> bytes:
+                    """Screenshot the slide image area only (left ~55% of article).
+                    Instagram desktop layout: image on left, caption sidebar on right.
+                    Cropping to left side excludes the repeating caption sidebar from OCR.
+                    """
+                    try:
+                        raw = article.screenshot()
+                    except Exception:
+                        raw = pg.screenshot()
+                    img_full = Image.open(_io.BytesIO(raw))
+                    w, h = img_full.size
+                    # Crop to the square image area (left portion, height-based)
+                    # The slide image is square, so crop to min(w*0.55, h) width
+                    crop_w = min(int(w * 0.55), h)
+                    cropped = img_full.crop((0, 0, crop_w, h))
+                    buf = _io.BytesIO()
+                    cropped.save(buf, format="PNG")
+                    return buf.getvalue()
+
+                screenshots.append(_shot_slide())
+
+                # Navigate carousel using force=True to bypass overlay interception
+                for _ in range(20):
+                    nxt = pg.locator("[aria-label='Next']").first
+                    if not nxt.is_visible(timeout=1000):
+                        break
+                    try:
+                        nxt.click(force=True, timeout=5000)
+                    except Exception:
+                        break
+                    pg.wait_for_timeout(600)
+                    screenshots.append(_shot_slide())
+
+                ctx.close()
+            finally:
+                shutil.rmtree(tmp_profile, ignore_errors=True)
+
+        # OCR screenshots — deduplicate text seen in previous slides
+        image_texts: list[str] = []
+        seen_lines: set[str] = set()
+        for i, ss in enumerate(screenshots, 1):
+            print(f"[OCR slide {i}/{len(screenshots)}...]", file=sys.stderr)
+            img = Image.open(_io.BytesIO(ss))
+            text = pytesseract.image_to_string(img, lang="eng").strip()
+            if not text or len(text) < 15:
+                continue
+            # Remove lines that appeared in previous slides (UI chrome repeats)
+            lines = text.splitlines()
+            fresh = [l for l in lines if l.strip() and l.strip() not in seen_lines]
+            seen_lines.update(l.strip() for l in lines if l.strip())
+            clean = "\n".join(fresh).strip()
+            if clean and len(clean) > 15:
+                image_texts.append(clean)
+
+        parts = [caption] if caption else []
+        parts.extend(image_texts)
+        if not parts:
+            raise RuntimeError("No content extracted from Instagram post")
+        return "\n\n---\n\n".join(parts), title
+
+    # ── Step 2b: Video → yt-dlp + Whisper ────────────────────────────────────
+    else:
+        _require_ytdlp()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dl = subprocess.run(
+                [YT_DLP, "--cookies-from-browser", "chrome",
+                 "-x", "-o", os.path.join(tmpdir, "video.%(ext)s"), url],
+                capture_output=True, text=True,
+            )
+            if dl.returncode != 0:
+                raise RuntimeError(
+                    f"yt-dlp audio download failed (ensure Instagram is logged-in in Chrome):\n{dl.stderr}"
+                )
+            audio = (
+                list(Path(tmpdir).glob("*.m4a")) or
+                list(Path(tmpdir).glob("*.mp3")) or
+                list(Path(tmpdir).glob("*.mp4")) or
+                list(Path(tmpdir).glob("video.*"))
+            )
+            if not audio:
+                raise RuntimeError("yt-dlp produced no audio file")
+            spoken = _parse_whisper_output(_whisper_transcribe(str(audio[0])))
+            parts = [caption] if caption else []
+            if spoken:
+                parts.append(spoken)
+            return "\n\n---\n\n".join(parts), title
 
 
 HANDLERS = {
