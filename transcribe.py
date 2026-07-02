@@ -586,7 +586,7 @@ def transcribe_instagram(url: str) -> tuple[str, str]:
     import urllib.request as _req, html as _html_mod
 
     # ── Step 1: Fetch embed page for metadata & post-type detection ──────────
-    shortcode = re.search(r'/p/([A-Za-z0-9_-]+)', url)
+    shortcode = re.search(r'/(?:p|reel|tv)/([A-Za-z0-9_-]+)', url)
     if not shortcode:
         raise RuntimeError(f"Cannot parse Instagram shortcode from URL: {url}")
     sc = shortcode.group(1)
@@ -603,8 +603,9 @@ def transcribe_instagram(url: str) -> tuple[str, str]:
     except Exception as e:
         page_html = ""
 
-    # Detect whether this is a video or image/carousel post
-    is_video = bool(re.search(r'"is_video"\s*:\s*true', page_html))
+    # /reel/ and /tv/ URLs are always videos; /p/ can be image, carousel, or video
+    is_reel = bool(re.search(r'/(?:reel|tv)/', url))
+    is_video = is_reel or bool(re.search(r'"is_video"\s*:\s*true', page_html))
 
     # Caption from embed JSON
     normalised = page_html.replace(r"\\/", "/").replace(r"\/", "/")
@@ -644,7 +645,6 @@ def transcribe_instagram(url: str) -> tuple[str, str]:
 
         screenshots: list[bytes] = []
         with sync_playwright() as pw:
-            import tempfile, shutil
             tmp_profile = tempfile.mkdtemp(prefix="ig_pw_")
             try:
                 ctx = pw.chromium.launch_persistent_context(
@@ -735,30 +735,125 @@ def transcribe_instagram(url: str) -> tuple[str, str]:
 
     # ── Step 2b: Video → yt-dlp + Whisper ────────────────────────────────────
     else:
-        _require_ytdlp()
-        with tempfile.TemporaryDirectory() as tmpdir:
-            dl = subprocess.run(
-                [YT_DLP, "--cookies-from-browser", "chrome",
-                 "-x", "-o", os.path.join(tmpdir, "video.%(ext)s"), url],
-                capture_output=True, text=True,
-            )
-            if dl.returncode != 0:
-                raise RuntimeError(
-                    f"yt-dlp audio download failed (ensure Instagram is logged-in in Chrome):\n{dl.stderr}"
+        # Instagram serves reels as MPEG-DASH (fragmented MP4 over blob: URLs).
+        # yt-dlp can't decrypt macOS Keychain cookies, so we use Playwright to
+        # intercept ALL video/mp4 CDN segment responses in arrival order, concatenate
+        # them (init segment first gives ffmpeg the moov/trex boxes it needs), then
+        # pass the reassembled file to Whisper.
+        try:
+            from playwright.sync_api import sync_playwright
+        except ImportError:
+            raise RuntimeError("Install: pip3 install playwright && playwright install chromium")
+
+        # Instagram serves DASH: m86 = video stream, m78 = audio stream.
+        # The browser makes multiple HTTP Range requests to the same CDN URL.
+        # We collect ALL responses (not deduped) and separate by stream type.
+        # Whisper only needs audio, so we reassemble only the m78 audio stream.
+        audio_chunks: list[bytes] = []   # m78 audio range responses, in order
+        video_init_chunks: list[bytes] = []  # m86 init (first small response) + data
+
+        post_url = f"https://www.instagram.com/p/{sc}/"
+        with sync_playwright() as pw:
+            tmp_profile2 = tempfile.mkdtemp(prefix="ig_pw_video_")
+            try:
+                ctx2 = pw.chromium.launch_persistent_context(
+                    user_data_dir=tmp_profile2,
+                    headless=True,
+                    args=["--disable-blink-features=AutomationControlled"],
                 )
-            audio = (
-                list(Path(tmpdir).glob("*.m4a")) or
-                list(Path(tmpdir).glob("*.mp3")) or
-                list(Path(tmpdir).glob("*.mp4")) or
-                list(Path(tmpdir).glob("video.*"))
+                pg2 = ctx2.new_page()
+
+                def _capture_segment(resp):
+                    ct = resp.headers.get("content-type", "")
+                    if "video" not in ct and "mp4" not in resp.url:
+                        return
+                    if "cdninstagram.com" not in resp.url:
+                        return
+                    try:
+                        data = resp.body()
+                    except Exception:
+                        return
+                    if not data or len(data) < 100:
+                        return
+                    # m78 = audio stream, m86 = video stream (we want both for muxing)
+                    if "/m78/" in resp.url:
+                        audio_chunks.append(data)
+                    elif "/m86/" in resp.url or "/m85/" in resp.url:
+                        video_init_chunks.append(data)
+
+                def _play_and_wait(pg):
+                    """Start video, wait for full duration so all audio segments are fetched."""
+                    pg.keyboard.press("Escape")
+                    pg.wait_for_timeout(1000)
+                    duration = None
+                    try:
+                        duration = pg.evaluate(
+                            "() => { const v = document.querySelector('video'); return v ? v.duration : null; }"
+                        )
+                        pg.evaluate(
+                            "() => { const v = document.querySelector('video'); if (v) { v.currentTime = 0; v.play(); } }"
+                        )
+                    except Exception:
+                        pass
+                    wait_ms = int((duration or 90) * 1000) + 8000
+                    print(f"[Reel duration {duration or '?'}s — waiting {wait_ms//1000}s for full audio...]", file=sys.stderr)
+                    pg.wait_for_timeout(wait_ms)
+
+                pg2.on("response", _capture_segment)
+                pg2.goto(post_url, wait_until="networkidle", timeout=30000)
+                _play_and_wait(pg2)
+
+                if not audio_chunks and not video_init_chunks:
+                    pg2.goto(url, wait_until="networkidle", timeout=30000)
+                    _play_and_wait(pg2)
+
+                ctx2.close()
+            finally:
+                shutil.rmtree(tmp_profile2, ignore_errors=True)
+
+        if not audio_chunks and not video_init_chunks:
+            raise RuntimeError(
+                "Could not capture video/audio from Instagram reel via Playwright. "
+                "The post may require login or the video didn't load."
             )
-            if not audio:
-                raise RuntimeError("yt-dlp produced no audio file")
-            spoken = _parse_whisper_output(_whisper_transcribe(str(audio[0])))
-            parts = [caption] if caption else []
-            if spoken:
-                parts.append(spoken)
-            return "\n\n---\n\n".join(parts), title
+
+        audio_kb = sum(len(c) for c in audio_chunks) // 1024
+        video_kb = sum(len(c) for c in video_init_chunks) // 1024
+        print(f"[Captured audio={audio_kb}KB video={video_kb}KB, muxing...]", file=sys.stderr)
+
+        whisper_available = WHISPER_AVAILABLE or os.access(WHISPER_BIN, os.X_OK)
+        if not whisper_available:
+            raise RuntimeError("Whisper not installed. Run: pip3 install openai-whisper")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            if audio_chunks:
+                # Write raw-concatenated audio stream (fMP4: init + data segments)
+                audio_raw = os.path.join(tmpdir, "audio_raw.mp4")
+                with open(audio_raw, "wb") as f:
+                    for chunk in audio_chunks:
+                        f.write(chunk)
+                # Re-mux into a proper MP4 so ffmpeg/Whisper can decode it
+                audio_mux = os.path.join(tmpdir, "audio.mp4")
+                mux = subprocess.run(
+                    ["ffmpeg", "-y", "-i", audio_raw, "-c:a", "copy", audio_mux],
+                    capture_output=True, text=True,
+                )
+                out_path = audio_mux if mux.returncode == 0 and os.path.exists(audio_mux) else audio_raw
+            else:
+                # Fallback: use video stream (has audio track too for most reels)
+                video_raw = os.path.join(tmpdir, "video_raw.mp4")
+                with open(video_raw, "wb") as f:
+                    for chunk in video_init_chunks:
+                        f.write(chunk)
+                out_path = video_raw
+
+            print(f"[Whisper transcribing reel...]", file=sys.stderr)
+            spoken = _parse_whisper_output(_whisper_transcribe(out_path))
+
+        parts = [caption] if caption else []
+        if spoken:
+            parts.append(spoken)
+        return "\n\n---\n\n".join(parts), title
 
 
 HANDLERS = {
