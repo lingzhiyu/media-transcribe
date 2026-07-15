@@ -733,24 +733,20 @@ def transcribe_instagram(url: str) -> tuple[str, str]:
             raise RuntimeError("No content extracted from Instagram post")
         return "\n\n---\n\n".join(parts), title
 
-    # ── Step 2b: Video → yt-dlp + Whisper ────────────────────────────────────
+    # ── Step 2b: Video → caption + frame OCR + Whisper audio ────────────────
     else:
-        # Instagram serves reels as MPEG-DASH (fragmented MP4 over blob: URLs).
-        # yt-dlp can't decrypt macOS Keychain cookies, so we use Playwright to
-        # intercept ALL video/mp4 CDN segment responses in arrival order, concatenate
-        # them (init segment first gives ffmpeg the moov/trex boxes it needs), then
-        # pass the reassembled file to Whisper.
+        # Strategy: collect everything available — caption (from rendered page),
+        # text overlays (OCR on video frames), spoken words (Whisper on audio stream).
+        # Only fail if all three come up empty.
         try:
             from playwright.sync_api import sync_playwright
         except ImportError:
             raise RuntimeError("Install: pip3 install playwright && playwright install chromium")
 
         # Instagram serves DASH: m86 = video stream, m78 = audio stream.
-        # The browser makes multiple HTTP Range requests to the same CDN URL.
-        # We collect ALL responses (not deduped) and separate by stream type.
-        # Whisper only needs audio, so we reassemble only the m78 audio stream.
-        audio_chunks: list[bytes] = []   # m78 audio range responses, in order
-        video_init_chunks: list[bytes] = []  # m86 init (first small response) + data
+        audio_chunks: list[bytes] = []
+        video_init_chunks: list[bytes] = []
+        frame_screenshots: list[bytes] = []
 
         post_url = f"https://www.instagram.com/p/{sc}/"
         with sync_playwright() as pw:
@@ -765,9 +761,11 @@ def transcribe_instagram(url: str) -> tuple[str, str]:
 
                 def _capture_segment(resp):
                     ct = resp.headers.get("content-type", "")
-                    if "video" not in ct and "mp4" not in resp.url:
+                    url = resp.url
+                    if "video" not in ct and "mp4" not in url:
                         return
-                    if "cdninstagram.com" not in resp.url:
+                    # Instagram CDN uses both cdninstagram.com and fbcdn.net domains
+                    if "cdninstagram.com" not in url and "fbcdn.net" not in url:
                         return
                     try:
                         data = resp.body()
@@ -775,14 +773,13 @@ def transcribe_instagram(url: str) -> tuple[str, str]:
                         return
                     if not data or len(data) < 100:
                         return
-                    # m78 = audio stream, m86 = video stream (we want both for muxing)
-                    if "/m78/" in resp.url:
+                    if "/m78/" in url:
                         audio_chunks.append(data)
-                    elif "/m86/" in resp.url or "/m85/" in resp.url:
+                    elif "/m86/" in url or "/m85/" in url or "/m367/" in url:
                         video_init_chunks.append(data)
 
                 def _play_and_wait(pg):
-                    """Start video, wait for full duration so all audio segments are fetched."""
+                    """Start video playback, return duration in seconds."""
                     pg.keyboard.press("Escape")
                     pg.wait_for_timeout(1000)
                     duration = None
@@ -798,61 +795,129 @@ def transcribe_instagram(url: str) -> tuple[str, str]:
                     wait_ms = int((duration or 90) * 1000) + 8000
                     print(f"[Reel duration {duration or '?'}s — waiting {wait_ms//1000}s for full audio...]", file=sys.stderr)
                     pg.wait_for_timeout(wait_ms)
+                    return duration
 
                 pg2.on("response", _capture_segment)
                 pg2.goto(post_url, wait_until="networkidle", timeout=30000)
-                _play_and_wait(pg2)
+                vid_duration = _play_and_wait(pg2)
 
                 if not audio_chunks and not video_init_chunks:
                     pg2.goto(url, wait_until="networkidle", timeout=30000)
-                    _play_and_wait(pg2)
+                    vid_duration = _play_and_wait(pg2)
+
+                # Always extract caption from the rendered page (og:description is
+                # most reliable; embed-page regex often misses JS-rendered content)
+                try:
+                    raw_cap = pg2.evaluate(
+                        """() => {
+                            const og = document.querySelector('meta[property="og:description"]');
+                            if (og && og.content && og.content.length > 5) return og.content;
+                            const h1 = document.querySelector('h1');
+                            if (h1 && h1.innerText && h1.innerText.length > 5) return h1.innerText;
+                            const spans = document.querySelectorAll('article span');
+                            for (const s of spans) {
+                                if (s.innerText && s.innerText.length > 10) return s.innerText;
+                            }
+                            return '';
+                        }"""
+                    )
+                    if raw_cap and len(raw_cap.strip()) > 5:
+                        caption = raw_cap.strip()
+                        first_line = caption.split("\n")[0].strip()
+                        title = first_line[:80] if first_line else title
+                except Exception:
+                    pass
+
+                # Capture evenly-spaced video frames for text-overlay OCR
+                try:
+                    if not vid_duration:
+                        vid_duration = pg2.evaluate(
+                            "() => { const v = document.querySelector('video'); return v ? v.duration : null; }"
+                        )
+                    if vid_duration and vid_duration > 0:
+                        n_frames = min(6, max(2, int(vid_duration / 2)))
+                        for i in range(n_frames):
+                            t = (i / max(n_frames - 1, 1)) * vid_duration
+                            pg2.evaluate(f"() => {{ const v = document.querySelector('video'); if (v) v.currentTime = {t}; }}")
+                            pg2.wait_for_timeout(400)
+                            frame_screenshots.append(pg2.screenshot())
+                except Exception:
+                    pass
 
                 ctx2.close()
             finally:
                 shutil.rmtree(tmp_profile2, ignore_errors=True)
 
-        if not audio_chunks and not video_init_chunks:
-            raise RuntimeError(
-                "Could not capture video/audio from Instagram reel via Playwright. "
-                "The post may require login or the video didn't load."
-            )
+        # OCR captured video frames (catches text overlays / slide-style reels)
+        frame_ocr_texts: list[str] = []
+        if frame_screenshots:
+            try:
+                import pytesseract
+                from PIL import Image
+                import io as _io
+                seen_lines: set[str] = set()
+                for i, ss in enumerate(frame_screenshots, 1):
+                    print(f"[OCR frame {i}/{len(frame_screenshots)}...]", file=sys.stderr)
+                    img = Image.open(_io.BytesIO(ss))
+                    text = pytesseract.image_to_string(img, lang="eng").strip()
+                    if text and len(text) > 15:
+                        lines = text.splitlines()
+                        fresh = [l for l in lines if l.strip() and l.strip() not in seen_lines]
+                        seen_lines.update(l.strip() for l in lines if l.strip())
+                        clean = "\n".join(fresh).strip()
+                        if clean and len(clean) > 15:
+                            frame_ocr_texts.append(clean)
+            except Exception as e:
+                print(f"[OCR frames failed: {e}]", file=sys.stderr)
 
-        audio_kb = sum(len(c) for c in audio_chunks) // 1024
-        video_kb = sum(len(c) for c in video_init_chunks) // 1024
-        print(f"[Captured audio={audio_kb}KB video={video_kb}KB, muxing...]", file=sys.stderr)
+        # Whisper audio transcription (skipped gracefully if no audio captured)
+        spoken = ""
+        if audio_chunks or video_init_chunks:
+            audio_kb = sum(len(c) for c in audio_chunks) // 1024
+            video_kb = sum(len(c) for c in video_init_chunks) // 1024
+            print(f"[Captured audio={audio_kb}KB video={video_kb}KB, muxing...]", file=sys.stderr)
 
-        whisper_available = WHISPER_AVAILABLE or os.access(WHISPER_BIN, os.X_OK)
-        if not whisper_available:
-            raise RuntimeError("Whisper not installed. Run: pip3 install openai-whisper")
+            whisper_available = WHISPER_AVAILABLE or os.access(WHISPER_BIN, os.X_OK)
+            if not whisper_available:
+                raise RuntimeError("Whisper not installed. Run: pip3 install openai-whisper")
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            if audio_chunks:
-                # Write raw-concatenated audio stream (fMP4: init + data segments)
-                audio_raw = os.path.join(tmpdir, "audio_raw.mp4")
-                with open(audio_raw, "wb") as f:
-                    for chunk in audio_chunks:
-                        f.write(chunk)
-                # Re-mux into a proper MP4 so ffmpeg/Whisper can decode it
-                audio_mux = os.path.join(tmpdir, "audio.mp4")
-                mux = subprocess.run(
-                    ["ffmpeg", "-y", "-i", audio_raw, "-c:a", "copy", audio_mux],
-                    capture_output=True, text=True,
-                )
-                out_path = audio_mux if mux.returncode == 0 and os.path.exists(audio_mux) else audio_raw
-            else:
-                # Fallback: use video stream (has audio track too for most reels)
-                video_raw = os.path.join(tmpdir, "video_raw.mp4")
-                with open(video_raw, "wb") as f:
-                    for chunk in video_init_chunks:
-                        f.write(chunk)
-                out_path = video_raw
+            with tempfile.TemporaryDirectory() as tmpdir:
+                if audio_chunks:
+                    audio_raw = os.path.join(tmpdir, "audio_raw.mp4")
+                    with open(audio_raw, "wb") as f:
+                        for chunk in audio_chunks:
+                            f.write(chunk)
+                    audio_mux = os.path.join(tmpdir, "audio.mp4")
+                    mux = subprocess.run(
+                        ["ffmpeg", "-y", "-i", audio_raw, "-c:a", "copy", audio_mux],
+                        capture_output=True, text=True,
+                    )
+                    out_path = audio_mux if mux.returncode == 0 and os.path.exists(audio_mux) else audio_raw
+                else:
+                    video_raw = os.path.join(tmpdir, "video_raw.mp4")
+                    with open(video_raw, "wb") as f:
+                        for chunk in video_init_chunks:
+                            f.write(chunk)
+                    out_path = video_raw
 
-            print(f"[Whisper transcribing reel...]", file=sys.stderr)
-            spoken = _parse_whisper_output(_whisper_transcribe(out_path))
+                print(f"[Whisper transcribing reel...]", file=sys.stderr)
+                try:
+                    spoken = _parse_whisper_output(_whisper_transcribe(out_path))
+                except Exception as e:
+                    print(f"[Whisper failed: {e}]", file=sys.stderr)
 
+        # Combine: caption + spoken transcript + frame OCR text
         parts = [caption] if caption else []
         if spoken:
             parts.append(spoken)
+        parts.extend(frame_ocr_texts)
+
+        if not parts:
+            raise RuntimeError(
+                "Could not extract any content from Instagram reel. "
+                "The post may require login or have no text/audio/visual content."
+            )
+
         return "\n\n---\n\n".join(parts), title
 
 
